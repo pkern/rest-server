@@ -22,6 +22,7 @@ import (
 
 	"github.com/minio/sha256-simd"
 	"github.com/miolini/datacounter"
+	"github.com/restic/rest-server/fs"
 	"github.com/restic/rest-server/quota"
 )
 
@@ -40,6 +41,7 @@ type Options struct {
 	BlobMetricFunc BlobMetricFunc
 	QuotaManager   *quota.Manager
 	FsyncWarning   *sync.Once
+	Filesystem     fs.Filesystem
 }
 
 // DefaultDirMode is the file mode used for directory creation if not
@@ -56,6 +58,9 @@ const DefaultFileMode os.FileMode = 0600
 func New(path string, opt Options) (*Handler, error) {
 	if path == "" {
 		return nil, fmt.Errorf("path is required")
+	}
+	if opt.Filesystem == nil {
+		opt.Filesystem = &fs.DiskFilesystem{}
 	}
 	if opt.DirMode == 0 {
 		opt.DirMode = DefaultDirMode
@@ -96,9 +101,6 @@ var errFileContentDoesntMatchHash = errors.New("file content does not match hash
 // BlobPathRE matches valid blob URI paths with optional object IDs
 var BlobPathRE = regexp.MustCompile(`^/(data|index|keys|locks|snapshots)/([0-9a-f]{64})?$`)
 
-// ObjectTypes are subdirs that are used for object storage
-var ObjectTypes = []string{"data", "index", "keys", "locks", "snapshots"}
-
 // FileTypes are files stored directly under the repo direct that are accessible
 // through a request
 var FileTypes = []string{"config"}
@@ -119,7 +121,7 @@ const (
 
 // BlobMetricFunc is the callback signature for blob metrics. Such a callback
 // can be passed in the Options to keep track of various metrics.
-// objectType: one of ObjectTypes
+// objectType: one of fs.ObjectTypes
 // operation: one of the BlobOperations above
 // nBytes: the number of bytes affected, or 0 if not relevant
 // TODO: Perhaps add http.Request for the username so that this can be cached?
@@ -480,13 +482,13 @@ func (h *Handler) checkBlob(w http.ResponseWriter, r *http.Request) {
 	}
 	path := h.getObjectPath(objectType, objectID)
 
-	st, err := os.Stat(path)
+	size, err := h.opt.Filesystem.CheckBlob(path)
 	if err != nil {
 		h.fileAccessError(w, err)
 		return
 	}
 
-	w.Header().Add("Content-Length", fmt.Sprint(st.Size()))
+	w.Header().Add("Content-Length", fmt.Sprint(size))
 }
 
 // getBlob retrieves a blob from the repository.
@@ -716,20 +718,9 @@ func (h *Handler) deleteBlob(w http.ResponseWriter, r *http.Request) {
 
 	path := h.getObjectPath(objectType, objectID)
 
-	var size int64
-	if h.needSize() {
-		stat, err := os.Stat(path)
-		if err == nil {
-			size = stat.Size()
-		}
-	}
-
-	if err := os.Remove(path); err != nil {
-		// ignore not exist errors to make deleting idempotent, which is
-		// necessary to properly handle request retries
-		if !errors.Is(err, os.ErrNotExist) {
-			h.fileAccessError(w, err)
-		}
+	size, err := h.opt.Filesystem.DeleteBlob(path, h.needSize())
+	if err != nil {
+		h.fileAccessError(w, err)
 		return
 	}
 
@@ -750,24 +741,9 @@ func (h *Handler) createRepo(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Creating repository directories in %s\n", h.path)
 
-	if err := os.MkdirAll(h.path, h.opt.DirMode); err != nil {
+	if err := h.opt.Filesystem.CreateRepo(h.path, h.opt.DirMode); err != nil {
 		h.internalServerError(w, err)
 		return
-	}
-
-	for _, d := range ObjectTypes {
-		if err := os.Mkdir(filepath.Join(h.path, d), h.opt.DirMode); err != nil && !os.IsExist(err) {
-			h.internalServerError(w, err)
-			return
-		}
-	}
-
-	for i := 0; i < 256; i++ {
-		dirPath := filepath.Join(h.path, "data", fmt.Sprintf("%02x", i))
-		if err := os.Mkdir(dirPath, h.opt.DirMode); err != nil && !os.IsExist(err) {
-			h.internalServerError(w, err)
-			return
-		}
 	}
 }
 
